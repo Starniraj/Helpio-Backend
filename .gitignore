@@ -4,3 +4,5 @@ node_modules
 .env.test
 build
 dist
+serviceAccountKey.dev.json
+serviceAccountKey.test.json

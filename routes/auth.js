@@ -16,18 +16,11 @@ router.post("/sync", veryifyFirebaseToken, async (req, res) => {
       return res.status(400).json({ message: "firebaseUid required" });
     }
 
-    // check user already exists
-    let user = await User.findOne({ email });
+    // check user already exists with email, if exists update info, else create new user
+      const user = await User.findOneAndUpdate({firebaseUid},
+        {$set:{name, phone, email, profession}},{upsert: true,new:true});
 
-    if (!user) {
-      user = await User.create({
-        firebaseUid,
-        name,
-        phone,
-        email,
-        profession,
-      });
-    }
+    console.log("User updated:", user.email);
 
     res.json(user);
   } catch (err) {
