@@ -6,3 +6,4 @@ build
 dist
 firebase/serviceAccountKey.dev.json
 firebase/serviceAccountKey.test.json
+firebase/serviceAccountKey.prod.json
