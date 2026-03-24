@@ -1,17 +1,17 @@
-const express  = require('express');
+const express = require('express');
 const dotenv = require('dotenv');
 const path = require('path');
 const connectDB = require('./config/db');
 const cors = require('cors');
 const authRoutes = require("./routes/auth");
 
+// Only load .env file in development — Render injects vars automatically in production
+if (process.env.NODE_ENV !== 'production') {
+  const env = process.env.NODE_ENV || 'dev';
+  dotenv.config({ path: path.resolve(__dirname, `.env.${env}`) });
+}
 
-// Load .env file based on NODE_ENV
-const env = process.env.NODE_ENV || 'dev';
-dotenv.config({ path: path.resolve(__dirname, `.env.${env}`) });
-
-console.log(`Environment: ${env}`);
-
+console.log(`Environment: ${process.env.NODE_ENV}`);
 console.log("MongoDB URI:", process.env.MONGO_URI);
 
 const app = express();
@@ -24,7 +24,6 @@ app.get('/', (req, res) => {
 });
 
 app.use("/api/auth", authRoutes);
-
 
 const PORT = process.env.PORT || 5000;
 
