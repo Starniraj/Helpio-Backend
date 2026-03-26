@@ -25,6 +25,9 @@ app.get('/', (req, res) => {
 
 app.use("/api/auth", authRoutes);
 
+const helpRoutes = require("./routes/help");
+app.use("/api/help", helpRoutes);
+
 const PORT = process.env.PORT || 5000;
 
 const startServer = async () => {
