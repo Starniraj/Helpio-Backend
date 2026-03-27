@@ -47,6 +47,9 @@ const HelpRequestSchema = new mongoose.Schema(
     acceptedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
     acceptedAt: { type: Date, default: null },
 
+    // Track helpers who declined — they won't see this request again
+    declinedBy: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+
     // Auto expire after 60 mins if not accepted
     expiresAt: {
       type: Date,

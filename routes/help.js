@@ -3,16 +3,56 @@ const router = express.Router();
 const HelpRequest = require("../models/HelpRequest");
 const User = require("../models/User");
 const verifyFirebaseToken = require("../middleware/verifyFirebaseToken");
+const { Expo } = require("expo-server-sdk");
+const expo = new Expo();
 
-// Profession → Category mapping (matches your types.ts)
+// Profession → Category mapping
 const CATEGORY_PROFESSION_MAP = {
   "Ride / Lift": ["Driver", "Delivery Partner", "Student", "Freelancer", "Other"],
-  Delivery: ["Delivery Partner", "Driver", "Student", "Freelancer", "Other"],
+  "Delivery": ["Delivery Partner", "Driver", "Student", "Freelancer", "Other"],
   "Vehicle Help": ["Driver", "Engineer", "Freelancer", "Other"],
   "Home Help": ["Plumber", "Electrician", "Engineer", "Freelancer", "Other"],
-  Emergency: ["Student", "Teacher", "Engineer", "Plumber", "Electrician", "Driver", "Delivery Partner", "Freelancer", "Other"],
-  Other: ["Student", "Teacher", "Engineer", "Plumber", "Electrician", "Driver", "Delivery Partner", "Freelancer", "Other"],
+  "Emergency": ["Student", "Teacher", "Engineer", "Plumber", "Electrician", "Driver", "Delivery Partner", "Freelancer", "Other"],
+  "Other": ["Student", "Teacher", "Engineer", "Plumber", "Electrician", "Driver", "Delivery Partner", "Freelancer", "Other"],
 };
+
+// ─────────────────────────────────────────────
+// Helper: Send push notification
+// ─────────────────────────────────────────────
+async function sendPushNotification(pushToken, title, body, data = {}) {
+  if (!pushToken || !Expo.isExpoPushToken(pushToken)) return;
+  try {
+    await expo.sendPushNotificationsAsync([{ to: pushToken, sound: "default", title, body, data }]);
+  } catch (err) {
+    console.error("Push error:", err.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// PATCH /api/help/user/location — Update user location + push token
+// ─────────────────────────────────────────────
+router.patch("/user/location", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { latitude, longitude, city, area, expoPushToken } = req.body;
+    if (!latitude || !longitude) return res.status(400).json({ message: "latitude and longitude required" });
+
+    await User.findByIdAndUpdate(req.user._id, {
+      $set: {
+        location: { type: "Point", coordinates: [parseFloat(longitude), parseFloat(latitude)] },
+        city: city || "",
+        area: area || "",
+        lastSeen: new Date(),
+        isActive: true,
+        ...(expoPushToken && { expoPushToken }), // save push token if provided
+      },
+    });
+
+    res.json({ message: "Location updated" });
+  } catch (err) {
+    console.error("Location update error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
 
 // ─────────────────────────────────────────────
 // POST /api/help — Post a new help request
@@ -21,10 +61,7 @@ router.post("/", verifyFirebaseToken, async (req, res) => {
   try {
     const { category, description, urgency, isPaid, budget, latitude, longitude, city, area } = req.body;
 
-    if (!req.user) {
-      return res.status(404).json({ message: "User not found. Please sync first." });
-    }
-
+    if (!req.user) return res.status(404).json({ message: "User not found. Please sync first." });
     if (!category || !description || !latitude || !longitude) {
       return res.status(400).json({ message: "category, description, latitude, longitude are required" });
     }
@@ -40,18 +77,46 @@ router.post("/", verifyFirebaseToken, async (req, res) => {
       urgency: urgency || "Medium",
       isPaid: isPaid || false,
       budget: isPaid ? budget || 0 : 0,
-      location: {
-        type: "Point",
-        coordinates: [parseFloat(longitude), parseFloat(latitude)], // MongoDB uses [lng, lat]
-      },
+      location: { type: "Point", coordinates: [parseFloat(longitude), parseFloat(latitude)] },
       city: city || "",
       area: area || "",
     });
 
-    res.status(201).json({
-      message: "Help request posted successfully",
-      request: helpRequest,
-    });
+    // 🔔 PUSH NOTIFICATION — notify nearby active users
+    // Only for HIGH urgency or paid requests
+    if (urgency === "High" || isPaid) {
+      const nearbyUsers = await User.find({
+        _id: { $ne: req.user._id },
+        isActive: true,
+        expoPushToken: { $exists: true, $ne: null },
+        location: {
+          $near: {
+            $geometry: { type: "Point", coordinates: [parseFloat(longitude), parseFloat(latitude)] },
+            $maxDistance: 4000, // 4km
+          },
+        },
+      }).select("expoPushToken profession");
+
+      // Filter by profession (unless HIGH urgency)
+      const usersToNotify = urgency === "High"
+        ? nearbyUsers
+        : nearbyUsers.filter((u) => {
+            const allowed = CATEGORY_PROFESSION_MAP[category] || [];
+            return allowed.includes(u.profession);
+          });
+
+      const title = urgency === "High" ? "🚨 Urgent Help Needed Nearby!" : "💰 Paid Help Request Nearby!";
+      const body = `${category}: ${description.substring(0, 60)}...`;
+
+      for (const u of usersToNotify) {
+        await sendPushNotification(u.expoPushToken, title, body, {
+          screen: "offerHelp",
+          requestId: helpRequest._id.toString(),
+        });
+      }
+    }
+
+    res.status(201).json({ message: "Help request posted successfully", request: helpRequest });
   } catch (err) {
     console.error("Post help error:", err);
     res.status(500).json({ message: "Server error" });
@@ -60,38 +125,26 @@ router.post("/", verifyFirebaseToken, async (req, res) => {
 
 // ─────────────────────────────────────────────
 // GET /api/help/nearby — Get nearby active requests
-// Query params: latitude, longitude, radius (optional, default 4km)
 // ─────────────────────────────────────────────
 router.get("/nearby", verifyFirebaseToken, async (req, res) => {
   try {
     const { latitude, longitude, radius } = req.query;
-
-    if (!latitude || !longitude) {
-      return res.status(400).json({ message: "latitude and longitude are required" });
-    }
-
-    if (!req.user) {
-      return res.status(404).json({ message: "User not found" });
-    }
+    if (!latitude || !longitude) return res.status(400).json({ message: "latitude and longitude required" });
+    if (!req.user) return res.status(404).json({ message: "User not found" });
 
     const userProfession = req.user.profession;
     const isStudent = userProfession === "Student";
-    const radiusInMeters = parseFloat(radius) || 4000; // default 4km
+    const radiusInMeters = parseFloat(radius) || 4000;
 
-    // First expire old requests (older than 60 mins)
+    // Expire old requests
     await HelpRequest.updateMany(
       { status: "active", expiresAt: { $lt: new Date() } },
       { $set: { status: "expired" } }
     );
 
-    // Build filter based on profession and urgency rules:
-    // Rule 1: HIGH urgency → everyone sees it
-    // Rule 2: Student → sees everything
-    // Rule 3: Others → only matching profession category
+    // Build profession/urgency filter
     let categoryFilter = {};
-
     if (!isStudent) {
-      // Get categories this profession can help with
       const allowedCategories = Object.entries(CATEGORY_PROFESSION_MAP)
         .filter(([_, professions]) => professions.includes(userProfession))
         .map(([category]) => category);
@@ -99,39 +152,29 @@ router.get("/nearby", verifyFirebaseToken, async (req, res) => {
       categoryFilter = {
         $or: [
           { urgency: "High" }, // HIGH urgency visible to everyone
-          { category: { $in: allowedCategories } }, // matching profession categories
+          { category: { $in: allowedCategories } },
         ],
       };
     }
-    // If student → no category filter (sees all)
 
     const requests = await HelpRequest.find({
       status: "active",
-      userId: { $ne: req.user._id }, // don't show own requests
+      userId: { $ne: req.user._id },          // not own requests
+      declinedBy: { $ne: req.user._id },       // 🔥 exclude declined requests
       location: {
         $near: {
-          $geometry: {
-            type: "Point",
-            coordinates: [parseFloat(longitude), parseFloat(latitude)],
-          },
+          $geometry: { type: "Point", coordinates: [parseFloat(longitude), parseFloat(latitude)] },
           $maxDistance: radiusInMeters,
         },
       },
       ...categoryFilter,
     })
-      .sort({ urgency: -1, createdAt: -1 }) // HIGH urgency first, then newest
+      .sort({ urgency: -1, createdAt: -1 })
       .limit(50);
 
-    // Calculate distance for each request and format response
     const formatted = requests.map((r) => {
       const [reqLng, reqLat] = r.location.coordinates;
-      const distanceKm = getDistanceKm(
-        parseFloat(latitude),
-        parseFloat(longitude),
-        reqLat,
-        reqLng
-      );
-
+      const distanceKm = getDistanceKm(parseFloat(latitude), parseFloat(longitude), reqLat, reqLng);
       return {
         id: r._id.toString(),
         userId: r.userId.toString(),
@@ -161,7 +204,7 @@ router.get("/nearby", verifyFirebaseToken, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// GET /api/help/my-requests — Get current user's requests
+// GET /api/help/my-requests — Requester's own requests
 // ─────────────────────────────────────────────
 router.get("/my-requests", verifyFirebaseToken, async (req, res) => {
   try {
@@ -171,7 +214,19 @@ router.get("/my-requests", verifyFirebaseToken, async (req, res) => {
       .sort({ createdAt: -1 })
       .limit(20);
 
-    res.json({ requests });
+    const formatted = requests.map((r) => ({
+      id: r._id.toString(),
+      category: r.category,
+      description: r.description,
+      urgency: r.urgency,
+      isPaid: r.isPaid,
+      budget: r.budget,
+      status: r.status,
+      acceptedBy: r.acceptedBy?.toString() || null,
+      createdAt: r.createdAt.getTime(),
+    }));
+
+    res.json({ requests: formatted });
   } catch (err) {
     console.error("My requests error:", err);
     res.status(500).json({ message: "Server error" });
@@ -187,81 +242,55 @@ router.patch("/:id/accept", verifyFirebaseToken, async (req, res) => {
 
     const request = await HelpRequest.findById(req.params.id);
     if (!request) return res.status(404).json({ message: "Request not found" });
-    if (request.status !== "active") {
-      return res.status(400).json({ message: "Request is no longer active" });
-    }
+    if (request.status !== "active") return res.status(400).json({ message: "Request is no longer active" });
     if (request.userId.toString() === req.user._id.toString()) {
       return res.status(400).json({ message: "Cannot accept your own request" });
     }
 
-    // Update request status
     request.status = "accepted";
     request.acceptedBy = req.user._id;
     request.acceptedAt = new Date();
     await request.save();
 
-    // Update helper stats + streak + karma
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    // 🔔 Notify REQUESTER that someone accepted
+    const requester = await User.findById(request.userId).select("expoPushToken name");
+    if (requester?.expoPushToken) {
+      await sendPushNotification(
+        requester.expoPushToken,
+        "✅ Someone accepted your request!",
+        `${req.user.name} is ready to help with your ${request.category} request.`,
+        { screen: "chat", requestId: request._id.toString() }
+      );
+    }
 
+    // Update streak + karma
+    const today = new Date(); today.setHours(0, 0, 0, 0);
     const helper = await User.findById(req.user._id);
     const lastHelp = helper.lastHelpDate ? new Date(helper.lastHelpDate) : null;
     const lastHelpDay = lastHelp ? new Date(lastHelp.setHours(0, 0, 0, 0)) : null;
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterday = new Date(today); yesterday.setDate(yesterday.getDate() - 1);
 
     let newStreak = helper.streak;
+    if (!lastHelpDay) newStreak = 1;
+    else if (lastHelpDay.getTime() === today.getTime()) newStreak = helper.streak;
+    else if (lastHelpDay.getTime() === yesterday.getTime()) newStreak = helper.streak + 1;
+    else newStreak = 1;
 
-    if (!lastHelpDay) {
-      // First help ever
-      newStreak = 1;
-    } else if (lastHelpDay.getTime() === today.getTime()) {
-      // Already helped today — don't increment streak
-      newStreak = helper.streak;
-    } else if (lastHelpDay.getTime() === yesterday.getTime()) {
-      // Helped yesterday — continue streak
-      newStreak = helper.streak + 1;
-    } else {
-      // Missed a day — reset streak
-      newStreak = 1;
-    }
-
-    // Karma points: High urgency = 30pts, Medium = 20pts, Low = 10pts, Paid = +5pts bonus
     const urgencyPoints = request.urgency === "High" ? 30 : request.urgency === "Medium" ? 20 : 10;
-    const paidBonus = request.isPaid ? 5 : 0;
-    const karmaEarned = urgencyPoints + paidBonus;
+    const karmaEarned = urgencyPoints + (request.isPaid ? 5 : 0);
 
-    // Check for streak badges
     const badges = helper.badges || [];
     if (newStreak >= 7 && !badges.includes("7day_streak")) badges.push("7day_streak");
     if (newStreak >= 30 && !badges.includes("30day_streak")) badges.push("30day_streak");
 
     await User.findByIdAndUpdate(req.user._id, {
-      $inc: {
-        helpGivenCount: 1,
-        totalHelps: 1,
-        karmaPoints: karmaEarned,
-        earnings: request.isPaid ? request.budget : 0,
-      },
-      $set: {
-        streak: newStreak,
-        lastHelpDate: new Date(),
-        longestStreak: Math.max(helper.longestStreak || 0, newStreak),
-        badges,
-      },
+      $inc: { helpGivenCount: 1, totalHelps: 1, karmaPoints: karmaEarned, earnings: request.isPaid ? request.budget : 0 },
+      $set: { streak: newStreak, lastHelpDate: new Date(), longestStreak: Math.max(helper.longestStreak || 0, newStreak), badges },
     });
 
-    // Update requester stats
-    await User.findByIdAndUpdate(request.userId, {
-      $inc: { helpReceivedCount: 1 },
-    });
+    await User.findByIdAndUpdate(request.userId, { $inc: { helpReceivedCount: 1 } });
 
-    res.json({
-      message: "Request accepted successfully",
-      request,
-      karmaEarned,
-      newStreak,
-    });
+    res.json({ message: "Request accepted", request, karmaEarned, newStreak });
   } catch (err) {
     console.error("Accept error:", err);
     res.status(500).json({ message: "Server error" });
@@ -269,7 +298,7 @@ router.patch("/:id/accept", verifyFirebaseToken, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// PATCH /api/help/:id/complete — Mark as completed
+// PATCH /api/help/:id/complete — Mark completed
 // ─────────────────────────────────────────────
 router.patch("/:id/complete", verifyFirebaseToken, async (req, res) => {
   try {
@@ -287,17 +316,14 @@ router.patch("/:id/complete", verifyFirebaseToken, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// GET /api/help/leaderboard — Area/City/India leaderboard
-// Query: type = area | city | india, city, area
+// GET /api/help/leaderboard
 // ─────────────────────────────────────────────
 router.get("/leaderboard", verifyFirebaseToken, async (req, res) => {
   try {
     const { type, city, area } = req.query;
-
     let filter = {};
     if (type === "area" && area) filter.area = area;
     else if (type === "city" && city) filter.city = city;
-    // india = no filter
 
     const leaders = await User.find(filter)
       .sort({ karmaPoints: -1, helpGivenCount: -1 })
@@ -312,52 +338,15 @@ router.get("/leaderboard", verifyFirebaseToken, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// PATCH /api/help/user/location — Update user location
-// Called when app opens or user moves
-// ─────────────────────────────────────────────
-router.patch("/user/location", verifyFirebaseToken, async (req, res) => {
-  try {
-    const { latitude, longitude, city, area } = req.body;
-    if (!latitude || !longitude) {
-      return res.status(400).json({ message: "latitude and longitude required" });
-    }
-
-    await User.findByIdAndUpdate(req.user._id, {
-      $set: {
-        location: {
-          type: "Point",
-          coordinates: [parseFloat(longitude), parseFloat(latitude)],
-        },
-        city: city || "",
-        area: area || "",
-        lastSeen: new Date(),
-        isActive: true,
-      },
-    });
-
-    res.json({ message: "Location updated" });
-  } catch (err) {
-    console.error("Location update error:", err);
-    res.status(500).json({ message: "Server error" });
-  }
-});
-
-// ─────────────────────────────────────────────
-// Haversine formula — calculate distance in km
+// Haversine distance formula
 // ─────────────────────────────────────────────
 function getDistanceKm(lat1, lon1, lat2, lon2) {
   const R = 6371;
   const dLat = deg2rad(lat2 - lat1);
   const dLon = deg2rad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) *
-    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) * Math.sin(dLon / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
-
-function deg2rad(deg) {
-  return deg * (Math.PI / 180);
-}
+function deg2rad(deg) { return deg * (Math.PI / 180); }
 
 module.exports = router;
