@@ -32,6 +32,10 @@ const chatRoutes = require("./routes/chat");
 app.use("/api/chat", chatRoutes);
 // help routes already added earlier
 
+//add rating routes
+
+const ratingRoutes = require("./routes/rating");
+app.use("/api/rating", ratingRoutes);
 const PORT = process.env.PORT || 5000;
 
 const startServer = async () => {
